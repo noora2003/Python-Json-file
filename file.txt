@@ -1,0 +1,410 @@
+import os
+import json
+import argparse
+import logging
+import csv
+import shlex
+import shutil
+from abc import ABC, abstractmethod
+
+def output_directory(config, res_status):
+    """Get the directory to store the output files based on config and result status."""
+    current_dir = os.path.join(os.getcwd(), 'output')
+    if config['Same_dir']:
+        return current_dir
+    else:
+        return os.path.join(current_dir, res_status)
+
+def setup_logging(config, res_status, base_name):
+    log_dir = output_directory(config, res_status)
+    os.makedirs(log_dir, exist_ok=True)
+    existing_log_files = [f for f in os.listdir(log_dir) if f.startswith(base_name) and f.endswith('.log')]
+    if len(existing_log_files) >= config['Max_log_files']:
+        existing_log_files.sort(key=lambda x: os.path.getmtime(os.path.join(log_dir, x)))
+        os.remove(os.path.join(log_dir, existing_log_files[0]))
+    log_file = os.path.join(log_dir, f'{base_name}_{len(existing_log_files) + 1}.log')
+
+    # Configure logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+
+    # Create file handler
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+
+    # Create console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+
+    # Create formatter and add it to the handlers
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+
+    # Clear existing handlers
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    # Add the handlers to the logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return log_file
+
+def setup_csv(config, res_status, base_name):
+    csv_dir = output_directory(config, res_status)
+    os.makedirs(csv_dir, exist_ok=True)
+    existing_csv_files = [f for f in os.listdir(csv_dir) if f.startswith(base_name) and f.endswith('.csv')]
+    if len(existing_csv_files) >= config['Max_log_files']:
+        existing_csv_files.sort(key=lambda x: os.path.getmtime(os.path.join(csv_dir, x)))
+        os.remove(os.path.join(csv_dir, existing_csv_files[0]))
+    csv_file = os.path.join(csv_dir, f'{base_name}_{len(existing_csv_files) + 1}.csv')
+    return csv_file
+
+class Command(ABC):
+    """Abstract base class for commands."""
+    @abstractmethod
+    def execute(self):
+        pass
+
+class MvLast(Command):
+    def __init__(self, src, dest):
+        self.__src = src
+        self.__dest = dest
+
+    def get_src(self):
+        return self.__src
+
+    def set_src(self, src):
+        self.__src = src
+
+    def get_dest(self):
+        return self.__dest
+
+    def set_dest(self, dest):
+        self.__dest = dest
+
+    def execute(self):
+        logging.info(f"Executing command: MvLast from {self.__src} to {self.__dest}")
+        try:
+            files = [os.path.join(self.__src, f) for f in os.listdir(self.__src) if os.path.isfile(os.path.join(self.__src, f))]
+            files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            if files:
+                shutil.move(files[0], self.__dest)
+                logging.debug(f"Moved {files[0]} from {self.__src} to {self.__dest} successfully.")
+                return True
+            else:
+                logging.debug(f"No file found in {self.__src}.")
+                return False
+        except Exception as e:
+            logging.error(f"Error when executing MvLast: {e}")
+            return False
+
+class Categorize(Command):
+    def __init__(self, dir, threshold_size):
+        self.__dir = dir
+        self.__threshold_size = self.__convert_size_to_bytes(threshold_size)
+
+    def get_dir(self):
+        return self.__dir
+
+    def set_dir(self, dir):
+        self.__dir = dir
+
+    def get_threshold_size(self):
+        return self.__threshold_size
+
+    def set_threshold_size(self, threshold_size):
+        self.__threshold_size = self.__convert_size_to_bytes(threshold_size)
+
+    def __convert_size_to_bytes(self, size_str):
+        units = {'B': 1, 'KB': 1024, 'MB': 1024 ** 2, 'GB': 1024 ** 3, 'TB': 1024 ** 4}
+        size = float(size_str[:-2])
+        unit = size_str[-2:].upper()
+        return int(size * units[unit])
+
+    def execute(self):
+        logging.info(f"Executing command: Categorize in {self.__dir} with threshold size {self.__threshold_size} bytes")
+        try:
+            files = [os.path.join(self.__dir, f) for f in os.listdir(self.__dir) if
+                     os.path.isfile(os.path.join(self.__dir, f))]
+            inner_small_dir = os.path.join(self.__dir, "inner_dir_small")
+            inner_large_dir = os.path.join(self.__dir, "inner_dir_large")
+            os.makedirs(inner_large_dir, exist_ok=True)
+            os.makedirs(inner_small_dir, exist_ok=True)
+            for file in files:
+                path_file = os.path.join(self.__dir, file)
+                if os.path.getsize(path_file) <= self.__threshold_size:
+                    shutil.move(path_file, os.path.join(inner_small_dir, os.path.basename(file)))
+                    logging.debug(f"Moved {file} to {inner_small_dir}")
+                else:
+                    shutil.move(path_file, os.path.join(inner_large_dir, os.path.basename(file)))
+                    logging.debug(f"Moved {file} to {inner_large_dir}")
+            return True
+        except Exception as e:
+            logging.error(f"Error when executing Categorize: {e}")
+            return False
+
+
+class Count(Command):
+    def __init__(self, dir):
+        self.__dir = dir
+
+    def get_dir(self):
+        return self.__dir
+
+    def set_dir(self, dir):
+        self.__dir = dir
+
+    def execute(self):
+        logging.info(f"Executing command: Count in {self.__dir}")
+        try:
+            files = [os.path.join(self.__dir, f) for f in os.listdir(self.__dir) if
+                     os.path.isfile(os.path.join(self.__dir, f))]
+            logging.debug(f"Found {len(files)} files in {self.__dir}")
+            return True
+        except Exception as e:
+            logging.error(f"Error when executing Count: {e}")
+            return False
+
+class Delete(Command):
+    def __init__(self, file, dir):
+        self.__dir = dir
+        self.__file = file
+
+    def get_dir(self):
+        return self.__dir
+
+    def set_dir(self, dir):
+        self.__dir = dir
+
+    def get_file(self):
+        return self.__file
+
+    def set_file(self, file):
+        self.__file = file
+
+    def execute(self):
+        logging.info(f"Executing command: Delete {self.__file} from {self.__dir}")
+        try:
+            path_file = os.path.join(self.__dir, self.__file)
+            if os.path.exists(path_file):
+                if os.access(path_file, os.W_OK):
+                    if os.path.isfile(path_file):
+                        os.remove(path_file)
+                        logging.debug(f"Deleted file {path_file} from {self.__dir}")
+                        return True
+                else:
+                    logging.error(f"Permission denied to delete {path_file}")
+                    return False
+            else:
+                logging.debug(f"{path_file} does not exist in {self.__dir}")
+                return False
+        except Exception as e:
+            logging.error(f"Error when executing Delete: {e}")
+            return False
+
+
+class Rename(Command):
+    def __init__(self, old_name, new_name, dir):
+        self.__old_name = old_name
+        self.__new_name = new_name
+        self.__dir = dir
+
+    def get_old_name(self):
+        return self.__old_name
+
+    def set_old_name(self, old_name):
+        self.__old_name = old_name
+
+    def get_new_name(self):
+        return self.__new_name
+
+    def set_new_name(self, new_name):
+        self.__new_name = new_name
+
+    def get_dir(self):
+        return self.__dir
+
+    def set_dir(self, dir):
+        self.__dir = dir
+
+    def execute(self):
+        logging.info(f"Executing command: Rename {self.__old_name} to {self.__new_name} in {self.__dir}")
+        try:
+            old_path = os.path.join(self.__dir, self.__old_name)
+            new_path = os.path.join(self.__dir, self.__new_name)
+            logging.debug(f"Old path: {old_path}")
+            logging.debug(f"New path: {new_path}")
+            if os.path.exists(old_path):
+                os.rename(old_path, new_path)
+                logging.debug(f"Renamed {old_path} to {new_path} successfully.")
+                return True
+            else:
+                logging.debug(f"{old_path} does not exist in {self.__dir}")
+                return False
+        except Exception as e:
+            logging.error(f"Error when executing Rename: {e}")
+            return False
+
+
+class ListAll(Command):
+    def __init__(self, dir):
+        self.__dir = dir
+
+    def get_dir(self):
+        return self.__dir
+
+    def set_dir(self, dir):
+        self.__dir = dir
+
+    def execute(self):
+        logging.info(f"Executing command: ListAll in {self.__dir}")
+        try:
+            items = os.listdir(self.__dir)
+            for item in items:
+                logging.debug(f"{item}")
+            return True
+        except Exception as e:
+            logging.error(f"Error when executing ListAll: {e}")
+            return False
+
+
+class SortCommand(Command):
+    def __init__(self, dir, criteria):
+        self.__dir = dir
+        self.__criteria = criteria
+
+    def execute(self):
+        logging.info(f"Executing command: Sort in {self.__dir} by {self.__criteria}")
+        try:
+            files = [f for f in os.listdir(self.__dir) if os.path.isfile(os.path.join(self.__dir, f))]
+
+            if self.__criteria == "name":
+                files.sort()
+            elif self.__criteria == "size":
+                files.sort(key=lambda x: os.path.getsize(os.path.join(self.__dir, x)))
+            elif self.__criteria == "date":
+                files.sort(key=lambda x: os.path.getmtime(os.path.join(self.__dir, x)))
+
+            # Write sorted filenames to a new file
+            output_file = os.path.join(self.__dir, f"sorted_{self.__criteria}.txt")
+            with open(output_file, 'w') as f:
+                for file in files:
+                    f.write(os.path.basename(file) + '\n')
+
+            logging.info(f"Sorted filenames written to: {output_file}")
+
+            return True
+        except Exception as e:
+            logging.error(f"Error when executing Sort: {e}")
+            return False
+
+
+
+class CommandFactory:
+    def __init__(self, threshold_size=None):
+        self.__threshold_size = threshold_size
+        self.__commands = {
+            'MvLast': MvLast,
+            'Count': Count,
+            'Rename': Rename,
+            'ListAll': ListAll,
+            'Sort': SortCommand,
+            'Delete': Delete,
+            'Categorize': lambda dir: Categorize(dir, self.__threshold_size)
+        }
+
+    def create_command(self, cmd, *args):
+        if cmd in self.__commands:
+            return self.__commands[cmd](*args)
+        else:
+            raise ValueError(f"Command {cmd} does not exist")
+
+
+def parse_script_file(file_path, command_factory):
+    cmds = []
+    with open(file_path, 'r') as file:
+        for line_num, line in enumerate(file, start=1):
+            parts = shlex.split(line.strip())
+            if not parts:
+                logging.warning(f"Empty line in script file at line {line_num}")
+                continue
+            cmd_name = parts[0]
+            cmd_args = parts[1:]
+            try:
+                logging.debug(f"Creating command: {cmd_name} with args: {cmd_args}")
+                cmd = command_factory.create_command(cmd_name, *cmd_args)
+                cmds.append(cmd)
+            except ValueError as e:
+                logging.error(f"Error when creating command at line {line_num}: {e}")
+
+    return cmds
+
+def execute_cmds(cmds, max_cmd):
+    results = {}
+    for i, cmd in enumerate(cmds, start=1):
+        if i > max_cmd:
+            logging.info("Reached the maximum number of commands to execute")
+            break
+        logging.info(f"Executing command #{i}")
+        try:
+            res = cmd.execute()
+            results[f"command#{i}"] = res
+            logging.info(f"Status of command #{i}: {res}")
+        except Exception as e:
+            logging.error(f"Error when executing command #{i}: {e}")
+            results[f"command#{i}"] = False
+    return results
+
+def output_res(results, config, base_name,cmds, max_commands):
+    try:
+        count = 1
+        res_status = 'passed' if all(results.values()) else 'failed'
+        if config['Output'] == 'csv':
+            output_file = setup_csv(config, res_status, base_name)
+            with open(output_file, 'w', newline='') as filecsv:
+                writer = csv.writer(filecsv)
+                for cmd, status in results.items():
+                    writer.writerow([f"{cmd}: {status}"])
+            logging.info(f"Output saved to: {output_file}")
+        else:
+            # Setup logging
+            res_status = 'passed' if all(results.values()) else 'failed'
+            log_file = setup_logging(config, res_status, args.output)
+            logging.info(f"Logging to file: {log_file}")
+            # Execute commands
+            for idx, command in enumerate(cmds):
+                logging.info(f"Executing command #{idx + 1}")
+                status = command.execute()
+                logging.info(f"Status of command #{idx + 1}: {status}")
+                if count >= max_commands:
+                    logging.warning(f"Maximum command limit ({max_commands}) reached. Stopping execution.")
+                    return
+                count += 1
+    except Exception as e:
+        logging.error(f"Error saving output: {e}")
+
+
+def main(script_file, out_base_name):
+    config_path = 'config.json'
+    with open(config_path, 'r') as file:
+        config = json.load(file)
+
+    max_commands = config.get("Max_commands", float('inf'))  # Get the Max_commands value from the config
+
+    command_factory = CommandFactory(config.get("Threshold_size"))
+    cmds = parse_script_file(script_file, command_factory)
+
+    # Execute commands while ensuring the maximum number of commands is not exceeded
+    results = execute_cmds(cmds, max_commands)
+    output_res(results, config, out_base_name,cmds,max_commands)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-i', '--input', help='Input script file', required=True)
+    parser.add_argument('-o', '--output', help='Base name for the output file', required=True)
+    args = parser.parse_args()
+
+    main(args.input, args.output)
